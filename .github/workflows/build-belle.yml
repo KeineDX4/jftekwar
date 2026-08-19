@@ -1,0 +1,69 @@
+name: CI Symbian Belle
+# No automatic triggers: runs only when started manually (Actions -> Run workflow).
+on:
+  workflow_dispatch:
+
+jobs:
+  # Gate: CI may only be triggered by the repo owner. GitHub Actions has no
+  # built-in per-actor filter on workflow_dispatch, so the build job depends on
+  # this one; a foreign actor fails it and nothing else runs.
+  authorize:
+    name: Authorize
+    runs-on: ubuntu-latest
+    steps:
+      - name: Only KeineDX4 may run CI
+        run: |
+          if [ "${{ github.actor }}" != "KeineDX4" ] && [ "${{ github.triggering_actor }}" != "KeineDX4" ]; then
+            echo "::error::CI is restricted to KeineDX4 (actor=${{ github.actor }}, triggering=${{ github.triggering_actor }})"
+            exit 1
+          fi
+
+  # Symbian Belle (Nokia E7): cross-compile with the symbian-belle-buildtools
+  # toolchain image (Debian 12 + Wine + Symbian^3 Qt SDK, qmake -> self-signed
+  # .sis). The container mounts the checked-out tree at /project and runs its
+  # /opt/toolchain/build-project.sh entrypoint with /project as the project dir.
+  build-belle:
+    name: Symbian Belle (Nokia E7)
+    runs-on: ubuntu-latest
+    needs: authorize
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Stamp build version
+        # The container stages the tree without .git, so the version strings
+        # (game_version from this repo, build_version from the jfbuild
+        # submodule) must be generated here, before the container starts. Each
+        # version file lives in its own tree with a DISTINCT basename
+        # (src/version-auto.c, jfbuild/src/build-version-auto.c): under
+        # qmake->.mmp->sbs everything compiles into one build dir keyed by
+        # source basename, so two files named version-auto.c would collapse into
+        # one object. Same mechanism as the desktop Makefiles (Makefile:140-146,
+        # jfbuild/Makefile); see tekwar.pro.
+        run: bash tools/stamp-version.sh
+      - name: Pull Belle toolchain image
+        run: docker pull keinedx2/symbian-belle-buildtools:final
+      - name: Build .sis
+        run: |
+          docker rm -f jftekwarbuild 2>/dev/null || true
+          docker run --name jftekwarbuild -v "$GITHUB_WORKSPACE":/project \
+            keinedx2/symbian-belle-buildtools:final /project
+          rc=$?
+          docker cp jftekwarbuild:/tmp/qmake-sbs.log "$GITHUB_WORKSPACE/qmake-sbs.log" 2>/dev/null || true
+          docker rm -f jftekwarbuild 2>/dev/null || true
+          if [ -s "$GITHUB_WORKSPACE/qmake-sbs.log" ]; then
+            echo "===== qmake-sbs.log ====="
+            cat "$GITHUB_WORKSPACE/qmake-sbs.log"
+          fi
+          echo "===== build output ====="
+          ls -la "$GITHUB_WORKSPACE/build/" 2>/dev/null || true
+          exit $rc
+      - name: Upload SIS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jftekwar-symbian-belle
+          path: build/*.sis
+          if-no-files-found: error

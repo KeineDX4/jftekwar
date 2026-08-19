@@ -1,0 +1,35 @@
+name: CI macOS
+# No automatic triggers: runs only when started manually (Actions -> Run workflow).
+on:
+  workflow_dispatch:
+
+jobs:
+  # Gate: CI may only be triggered by the repo owner. GitHub Actions has no
+  # built-in per-actor filter on workflow_dispatch, so the build job depends on
+  # this one; a foreign actor fails it and nothing else runs.
+  authorize:
+    name: Authorize
+    runs-on: ubuntu-latest
+    steps:
+      - name: Only KeineDX4 may run CI
+        run: |
+          if [ "${{ github.actor }}" != "KeineDX4" ] && [ "${{ github.triggering_actor }}" != "KeineDX4" ]; then
+            echo "::error::CI is restricted to KeineDX4 (actor=${{ github.actor }}, triggering=${{ github.triggering_actor }})"
+            exit 1
+          fi
+
+  build-macos:
+    name: macOS
+    runs-on: macos-latest
+    needs: authorize
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Build
+        run: |
+          set -xe
+          cd $GITHUB_WORKSPACE/xcode
+          xcodebuild -project tekwar.xcodeproj -target all
