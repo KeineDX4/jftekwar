@@ -11,6 +11,10 @@
 #include "tekwar.h"
 #include "tekver.c"
 
+#ifdef __SYMBIAN32__
+#include "belle_config.h"
+#endif
+
 #define   SECT_LOTAG_CLIMB                    5060
 
 #ifdef    TEKWAR
@@ -34,6 +38,14 @@ short     yaw,pitch,roll,vrangle,vrpitch;
 int       mouselookmode,mouselook;
 
 #endif
+
+// Voxel-id counter for the engine's DEF parser. jfbuild links defs.o into the
+// engine lib that the game uses, and defs.c only declares the symbol extern;
+// on desktop it is the editor stub (src/bstub.c, build.exe) that defines it,
+// so a plain game link would come up one symbol short. The reference port
+// defines it in its game main source the same way; here it lives in
+// tekgame.c, the game's main source.
+int nextvoxid = 0;
 
 int vel, svel, angvel, horizvel;
 int vel2, svel2, angvel2, horizvel2;
@@ -361,6 +373,28 @@ app_main(int argc, char const * const argv[])
      }
 #endif
 
+#ifdef __SYMBIAN32__
+     // JFTekWar/Belle: the game data lives in BELLE_GAME_DIR (tekwar.pro), the
+     // on-device folder next to STUFF.DAT. mkdir() here creates only one level,
+     // so the parent drive root is made first. addsearchpath() lets the engine
+     // find the DAT, and chdir() makes this directory the process CWD:
+     // tekwar.log, tekwar.ini and savegames land right next to STUFF.DAT -- the
+     // default Symbian process CWD is a private directory the user can't browse.
+     {
+          char belle_dir[BMAX_PATH+1];
+          char *slash;
+          strcpy(belle_dir, BELLE_GAME_DIR);
+          slash = strrchr(belle_dir, '/');
+          if (slash) {
+               *slash = 0;
+               mkdir(belle_dir, S_IRWXU);
+          }
+          mkdir(BELLE_GAME_DIR, S_IRWXU);
+          addsearchpath(BELLE_GAME_DIR);
+          chdir(BELLE_GAME_DIR);
+     }
+#endif
+
      {
           char *supportdir = Bgetsupportdir(1);
           char *appdir = Bgetappdir();
@@ -435,6 +469,19 @@ app_main(int argc, char const * const argv[])
      memcpy(keys,defaultkeys,sizeof(keys));
      lm("tekloadsetup");
      tekloadsetup();
+
+#ifdef __SYMBIAN32__
+     // JFTekWar/Belle: no resolution menu on this port (vesares/option[6] lives
+     // in the dead DOANNOYINGTITLESCREEN path) -- pin the software renderer to
+     // 320x200x8, TekWar's native DOS resolution. Exactly 4x fewer pixels than
+     // 640x480, i.e. roughly 4x faster software rasterization on the 680 MHz
+     // ARM11 (same choice and reasoning as the reference port). belle_layer's
+     // setvideomode() accepts 320x200x8; paintEvent upscales the backbuffer to
+     // the E7's 640x360 panel (aspect-fit, ~1ms nearest-neighbour).
+     xdimgame = 320;
+     ydimgame = 200;
+     bppgame = 8;
+#endif
 
 #ifdef HAVE_STARTWIN
     {

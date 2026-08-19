@@ -25,3 +25,7 @@
 
 /tekwar
 /build
+
+# Symbian Belle build artifacts (host-side)
+qmake-sbs.log
+jftekwar-build.log

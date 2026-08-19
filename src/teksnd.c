@@ -8,6 +8,9 @@
 #include "pragmas.h"
 #include "fx_man.h"
 #include "music.h"
+#ifdef __SYMBIAN32__
+#include "belle_music.h"
+#endif
 #include "tekwar.h"
 
 #ifdef RENDERTYPEWIN
@@ -99,6 +102,13 @@ setupdigi(void)
 static void
 setupmidi(void)
 {
+#ifdef __SYMBIAN32__
+     /* JFTekWar/Belle: no MIDI/OPL2 synth -- music is pre-rendered OGG (see
+        belle_music.c), so the SONGS file index is not needed. */
+     songplaying = -1;
+     totalsongsperlevel=SONGSPERLEVEL*AVAILMODES;
+     return;
+#else
      int       i;
 
      fhsongs = kopen4load("songs", 0);
@@ -114,6 +124,7 @@ setupmidi(void)
 
      songplaying = -1;
      totalsongsperlevel=SONGSPERLEVEL*AVAILMODES;
+#endif
 }
 
 static void
@@ -489,6 +500,17 @@ playsong(int sn)
      }
 
      removesong(sn);
+#ifdef __SYMBIAN32__
+     /* JFTekWar/Belle: play the OGG pre-render chosen by startmusic/menusong
+        (belle_songfile) straight through the FX/vorbis path. */
+     rv = MUSIC_PlaySong(NULL, 0, 1);
+     if( rv != MUSIC_Ok ) {
+          buildprintf("playsong: could not play song: %s\n", MUSIC_ErrorString(MUSIC_ErrorCode));
+          return 0;
+     }
+     songplaying = sn;
+     return(1);
+#else
      if( songlengths[sn] == 0 )
          return(0);
 
@@ -516,6 +538,7 @@ playsong(int sn)
      songplaying = sn;
 
      return(1);
+#endif
 }
 
 void
@@ -544,6 +567,13 @@ menusong(int insubway)
 
      index+=2;
 
+#ifdef __SYMBIAN32__
+     /* JFTekWar/Belle: pre-rendered OGG for this song index (menu = 65,
+        subway menu = 68). */
+     Bsnprintf(belle_songfile, sizeof(belle_songfile), "music/song_%03d.ogg", index);
+     playsong(BASESONG);
+     return;
+#else
      songoffsets[BASESONG] = songlist[index*3]*4096;
      songlengths[BASESONG] = songlist[(index*3)+1];
      if( songlengths[BASESONG] >= MAXBASESONGLENGTH ) {
@@ -551,6 +581,7 @@ menusong(int insubway)
      }
 
      playsong(BASESONG);
+#endif
 }
 
 void
@@ -575,6 +606,13 @@ startmusic(int level)
      index+=SONGSPERLEVEL;    // Skip FM.
      index+=SONGSPERLEVEL;    // Skip AWE32.
 
+#ifdef __SYMBIAN32__
+     /* JFTekWar/Belle: the GM song entry for level L is 9*L+6 (the FM/AWE32
+        variants above are skipped); play the matching pre-rendered OGG. */
+     Bsnprintf(belle_songfile, sizeof(belle_songfile), "music/song_%03d.ogg", index);
+     playsong(BASESONG);
+     return;
+#else
      for( i=0; i<SONGSPERLEVEL; i++ ) {
           songoffsets[i]=songlist[(index*3)+(i*3)]*4096;
           songlengths[i]=songlist[((index*3)+(i*3))+1];
@@ -584,6 +622,7 @@ startmusic(int level)
      }
 
      playsong(BASESONG);
+#endif
 }
 
 

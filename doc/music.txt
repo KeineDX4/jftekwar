@@ -1,0 +1,334 @@
+JFTekWar Belle Music Pipeline
+=============================
+
+This document describes how music is produced and played for the
+Symbian Belle (Nokia E7) port of JFTekWar.  It is intended for whoever
+maintains the port; formatting follows the JFBuild docs in
+jfbuild/doc/.
+
+Music on the Belle port is not synthesised on the device.  Belle has no
+OPL2-FM chip and no MIDI sequencer to drive, so the game's original
+music data (the SONGS file, HMI-format MIDI meant for OPL2) is
+converted on the host to Standard MIDI, rendered to OGG with a
+General-MIDI synthesizer, and played back through the existing
+jfaudiolib FX/vorbis path - the same decoder the reference port uses on this phone.
+
+The tooling lives in tools/ and the on-device glue in src/:
+
+    tools/render-music.c     extracts Standard MIDI from SONGS
+    tools/render-music.sh    renders those MIDI files to OGG
+    doc/music.txt            this document
+    src/teksnd.c             song index math and the Belle music seam
+    src/belle_music.c        MUSIC_* shim for the device
+    src/belle_config.h       BELLE_GAME_DIR (E:/Games/Tekwar)
+
+Contents
+--------
+    1. Why pre-rendered OGG
+    2. The game's music data (SONGS / HMI / OPL2)
+    3. Pipeline overview
+    4. Stage 1 - extract the SMF (render-music.c)
+    5. Stage 2 - render the OGG (render-music.sh)
+    6. Stage 3 - deploy to the device
+    7. Output layout and song index
+    8. On-device playback
+    9. Requirements
+   10. Notes and future work
+
+
+1. Why pre-rendered OGG
+-----------------------
+
+The original game music was sequenced on the fly for an AdLib/OPL2 FM
+chip.  The E7 has neither that chip nor a sound card; its audio output
+is a software audio sink driven by CMMFDevSound.  Three options exist:
+
+  - Implement a full OPL2 emulation and MIDI sequencer on the device.
+    Accurate and compact, but a large amount of new code, and the E7's
+    single 680 MHz ARM11 core has better uses.
+
+  - Render the MIDI to OGG on the host, once, and stream the files.
+    Chosen.  The game already ships with FX/vorbis playback in
+    jfaudiolib (stb_vorbis + a background ring decoder), so the device
+    only needs to know a file name and the whole synthesizer vanishes
+    from the Belle build.
+
+  - Ship the original .mid on the device and decode it on the phone
+    with a software GM synth.  Tempting for size, but Belle still has
+    no convenient GM synth and the port would again carry a large new
+    component.
+
+Because HMI files are little-endian and OPL2-timbre-specific, rendering
+on the host also lets us pick the synthesizer, soundfont and format
+freely without touching the device code.
+
+
+2. The game's music data (SONGS / HMI / OPL2)
+---------------------------------------------
+
+The music is the file SONGS, next to STUFF.DAT.  It is not a single
+song: it is a container holding every song variant for every level,
+each stored as an HMI chunk.
+
+  Layout of SONGS:
+
+      [ HMI chunk 0 ] [ HMI chunk 1 ] ... [ index table ]
+
+      - Chunks live at 4096-byte block offsets (offset*4096).  A chunk
+        is a whole HMI song (a.k.a. SOS / NDMF), identified by the
+        magic "HMIMIDIP013195" in its first 32 bytes.
+
+      - The index table is the LAST 1024 int32s of the file, little-
+        endian, three int32s per song entry:
+            songlist[E*3+0] = chunk offset in 4096-byte blocks
+            songlist[E*3+1] = chunk length in bytes
+            songlist[E*3+2] = unused
+        The game reads it from the END of the file (teksnd.c:
+        setupmidi()).
+
+  Per level the game knows nine entries: three AWE32 variants, three FM
+  (OPL2) variants and three General-MIDI variants.  The three GM
+  variants for level L sit at entries 9*L+6, 9*L+7, 9*L+8.  The menu
+  group is {63,64,65}, the subway-menu group {66,67,68}; menusong()
+  selects the third entry of each by adding 2 to the group start
+  (teksnd.c:563-568).  The game always plays BASESONG=0 of the current
+  context, i.e. entry 9*L+6 for the levels, 65 for the menu and 68 for
+  the subway menu.
+
+  HMI/NDMF is a MIDI-like format: little-endian, NDMF variable-length
+  encoding (low byte first), with an extra channel-priority table and a
+  branch table.  The data is written for the OPL2 FM timbres (MELODIC
+  and DRUM bank data lives in MELODIC.BNK / DRUM.BNK).
+
+  Conversion is done by transmutehmp() in teksnd.c:698-825 (Jonathon
+  Fowler, 2023, public domain).  It rewrites an HMI buffer in place to
+  a Standard MIDI file: big-endian, MIDI variable-length encoding, a
+  tempo event injected into track 0, and SOS/EMIDI custom controllers
+  110/111 (global loop start/end) translated to the Apogee EMIDI
+  controllers 118/119 so a loop-aware player can use them.
+
+
+3. Pipeline overview
+--------------------
+
+The pipeline has three stages, each one-way and idempotent:
+
+    SONGS --[render-music.c]--> song_XXX.mid --[render-music.sh]--> song_XXX.ogg
+                                                   |
+                                                   v
+                              copied to the device: E:\Games\Tekwar\music\song_XXX.ogg
+
+The .ogg files are named after the GLOBAL song-entry index in SONGS
+(song_006.ogg ... song_068.ogg).  The device code only ever names the
+first song of each context, so exactly these names must exist:
+
+    level 0 ... level 6  ->  song_006.ogg ... song_060.ogg (entry 9*L+6)
+    menu                 ->  song_065.ogg
+    subway menu          ->  song_068.ogg
+
+The tool renders all 27 GM entries anyway so the naming stays complete
+and independent of which context is being played.
+
+
+4. Stage 1 - extract the SMF (render-music.c)
+---------------------------------------------
+
+tools/render-music.c is a standalone host program.  It needs no
+jfbuild or jfaudiolib code; transmutehmp() and the NDMF/SMF structs are
+copied in verbatim from src/teksnd.c (public domain, attributed in a
+header comment) so the tool builds anywhere with a C compiler.
+
+  Usage:
+
+      render-music <game-data-dir> [out-dir]
+
+      <game-data-dir>   directory containing SONGS
+      [out-dir]         where music/ is created (default: game-data-dir)
+
+  What it does:
+
+    - Reads the whole SONGS file into memory (about 1 MB).
+    - Copies the 1024-int32 index table from the end of the file and
+      byte-swaps it to host order.
+    - For each of the 27 GM entries (7 levels x 3 + menu + subway):
+        off  = songlist[E*3]   * 4096
+        len  = songlist[E*3+1]
+        skips entries whose length is <= 0 or > 44136 bytes
+        (MAXBASESONGLENGTH, the game's buffer) or whose range falls
+        outside the file;
+      reads the chunk, runs transmutehmp() on it, and on success
+      writes <out-dir>/music/song_%03d.mid with the entry index E.
+      Chunks that do not carry the "HMIMIDIP013195" magic are reported
+      and skipped.
+
+  Result: 27 Standard MIDI files, one per GM song entry.  Each SMF has
+  one track per HMI track, carries a tempo meta event, and keeps the
+  global-loop controllers 118/119 on track 1.
+
+
+5. Stage 2 - render the OGG (render-music.sh)
+---------------------------------------------
+
+tools/render-music.sh builds render-music.c, runs it, then renders each
+.mid to a 22050 Hz mono OGG.  It is a WSL/Linux script (the game-data
+directory defaults to the WSL mount /mnt/h/Games/Tekwar).
+
+  Usage:
+
+      tools/render-music.sh [game-data-dir] [out-dir]
+
+  Synthesizer selection (first match wins):
+
+      fluidsynth  + a GM soundfont  (preferred).  The font is looked up
+                  at the usual /usr/share/sounds/sf2|sf3 paths; point
+                  TEKWAR_SF2 at a specific file to override.
+      timidity                     (fallback; needs no font).
+
+  Each .mid is synthesised to a WAV, then converted with
+
+      sox in.wav -r 22050 -c 1 -C 5 out.ogg
+
+  i.e. resampled to 22050 Hz mono (the device mix rate) at Vorbis
+  quality 5.  The intermediate .wav and .mid files are deleted; only
+  the .ogg files remain.  A render failure for one song prints a
+  warning and continues with the next; the script's exit status stays
+  success so a single bad song does not abort the batch.
+
+  Output goes to <out-dir>/music/, which defaults to the game-data
+  directory itself - the OGG files are then already in the place they
+  belong on the device image.
+
+
+6. Stage 3 - deploy to the device
+---------------------------------
+
+The device looks for music under the game directory
+(BELLE_GAME_DIR = E:/Games/Tekwar, see src/belle_config.h) as
+music/song_%03d.ogg, resolved relative to the process current
+directory set by tekgame.c.  Copy the music/ directory next to
+STUFF.DAT:
+
+      E:\Games\Tekwar\STUFF.DAT      (as today)
+      E:\Games\Tekwar\music\*.ogg    (new)
+
+A missing music/ directory is harmless: playsong() simply does not
+start (see section 8).
+
+
+7. Output layout and song index
+-------------------------------
+
+  File name        Contents
+  ---------        --------
+  song_006.ogg     Level 1      (entry 9*0+6, BASESONG=0)
+  song_015.ogg     Level 2      (9*1+6)
+  song_024.ogg     Level 3
+  song_033.ogg     Level 4
+  song_042.ogg     Level 5
+  song_051.ogg     Level 6
+  song_060.ogg     Level 7
+  song_065.ogg     Menu
+  song_068.ogg     Subway menu
+
+  song_007/008, 016/017, ..., 061/062, 063/064 and 066/067 are the
+  unused second/third GM variants of the same contexts, rendered for
+  completeness: the menu plays entry 65 of its group {63,64,65}, the
+  subway entry 68 of {66,67,68}.  Entries 69/70 are zero-length and are
+  not emitted.  The game never requests the unused variants (only
+  BASESONG=0 is ever played).
+
+  The index is declared in the game as songlist[1024] (teksnd.c); the
+  context start entries are constants: the level song at
+  totalsongsperlevel*level + SONGSPERLEVEL + SONGSPERLEVEL (= 9*L+6),
+  the menu at 65 and the subway menu at 68 (menusong()/startmusic(),
+  teksnd.c).
+
+
+8. On-device playback
+---------------------
+
+The device seam is already in place in the Belle build:
+
+  - teksnd.c: under __SYMBIAN32__ the setupmidi()/playsong()/
+    menusong()/startmusic() branches skip the SONGS parsing and instead
+    build a file name into belle_songfile and call the MUSIC_* API:
+        startmusic(level)  ->  belle_songfile = "music/song_%03d.ogg"
+                               with index 9*level+6, then playsong();
+        menusong(...)      ->  index 65 or 68.
+    playsong() calls MUSIC_PlaySong(NULL, 0, 1) and returns.
+
+  - src/belle_music.c implements the MUSIC_* interface (see music.h).
+    MUSIC_PlaySong() loads belle_songfile with fopen, then
+
+        songvoice = FX_PlayLoopedAuto(songptr, songlen, 0, 0, 0,
+                                      musicvolume, musicvolume,
+                                      musicvolume, FX_MUSIC_PRIORITY,
+                                      (unsigned int)-1);
+
+    The trailing callback value is (unsigned int)-1 on purpose: the
+    sound effect path indexes dsound[i] by its callback value, and -1
+    is the sentinel the music voice must use so it can never be
+    mistaken for a sound effect.  MUSIC_SetVolume() maps to
+    FX_SetPan() on the voice; MUSIC_StopSong() stops and frees it.
+
+  - FX_PlayLoopedAuto() detects the "OggS" magic and routes to
+    MV_PlayLoopedVorbis() (jfaudiolib vorbis.c), which decodes with
+    stb_vorbis into a background ring buffer fed to the audio driver
+    (driver_belle.c, CMMFDevSound).  Looping is whole-file: when the
+    file ends it is re-decoded from the start, so songs with a long
+    intro before their loop region replay that intro on every pass
+    (see section 10).
+
+  - Failure behaviour: if music/song_XXX.ogg is absent, fopen fails,
+    playsong() returns without starting anything and the game runs
+    silent.  No crash, no log spam.
+
+  The only MUSIC_* entry points the engine uses are Init, SetVolume,
+  StopSong, PlaySong, ErrorString, ErrorCode and Shutdown; the other
+  21 music.h functions are present in belle_music.c as no-ops.
+
+
+9. Requirements
+---------------
+
+  Host (WSL/Linux):
+      gcc          to build render-music.c
+      sox          resample + OGG encoding (package: sox, libsox-fmt-ogg)
+      fluidsynth   plus a GM soundfont, e.g. FluidR3 (package:
+                   fluidsynth, fluidsynth-git-soundfont), or timidity
+
+  Windows hosts may run the .sh under WSL; the game data is reachable
+  at /mnt/h/Games/Tekwar.  If the drive is not auto-mounted in WSL,
+  mount it first:
+
+      sudo mount -t drvfs H: /mnt/h
+
+  render-music.c itself compiles on any POSIX or Windows (MinGW)
+  system - only render-music.sh assumes a POSIX shell.
+
+  Device: none - the OGGs are plain files; decoding rides on the
+  existing FX/vorbis code already used for sound on this phone.
+
+
+10. Notes and future work
+-------------------------
+
+  - Whole-file looping.  The SMF keeps EMIDI controllers 118 (loop
+    start) and 119 (loop end) on track 1, but stage 2 renders the whole
+    song and the device loops the whole OGG.  Seamless music would need
+    a loop-point-aware renderer: read controller 118/119, cut the OGG
+    at the sample corresponding to the loop end, and pass the loop
+    start offset to the vorbis decoder.  Not implemented; music plays
+    acceptably looping from the start of the file.
+
+  - OPL2-authentic timbres.  The default render uses a General-MIDI
+    soundfont, which gives a modern GM sound rather than the original
+    OPL2 FM sound.  Because the render is off-device, pointing
+    TEKWAR_SF2 at an OPL3-style FM soundfont (e.g. an .sf2 built from
+    the OPL3 FM synthesis presets) recovers a sound much closer to the
+    1990s original with no device-side change.
+
+  - Regenerating music only requires re-running stage 2; the SMF files
+    are stable.  Commit the generated .ogg files to the repo (like the
+    reference port's .mif/.mbm) so the device data is reproducible
+    without the soundfont/tooling installed.
